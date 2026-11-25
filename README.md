@@ -1,4 +1,4 @@
-# maple-android-tools
+# kaede-android-tools
 
 A minimal MCP server that lets an agent drive a real Android phone the way a
 person does: read the screen, tap what it sees, type into fields, and reach into
@@ -33,7 +33,7 @@ It talks to three layers under the hood and picks the right one per situation:
 ## Install
 
 ```sh
-uv tool install git+https://github.com/MapleProjects/maple-android-tools
+uv tool install git+https://github.com/MapleProjects/kaede-android-tools
 ```
 
 or from a clone:
@@ -51,7 +51,7 @@ Requires `adb` in `PATH`, a phone with USB debugging authorised, and Python 3.10
   "mcp": {
     "android": {
       "type": "local",
-      "command": ["maple-android-tools"],
+      "command": ["kaede-android-tools"],
       "environment": { "ANDROID_SERIAL": "R58R8585EHR" }
     }
   }

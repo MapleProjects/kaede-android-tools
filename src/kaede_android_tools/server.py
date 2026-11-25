@@ -1,4 +1,4 @@
-"""maple-android-tools: three tools to drive an Android phone precisely.
+"""kaede-android-tools: three tools to drive an Android phone precisely.
 
 Design rules:
   * every action returns the resulting screen, so the agent never needs a
@@ -20,7 +20,7 @@ try:  # mcp >= 2 renamed FastMCP to MCPServer
 except ImportError:  # pragma: no cover
     from mcp.server.fastmcp import FastMCP as _Server
 
-mcp = _Server("maple-android-tools")
+mcp = _Server("kaede-android-tools")
 
 _dev: Device | None = None
 _web: Web | None = None

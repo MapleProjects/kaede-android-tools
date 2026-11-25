@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from maple_android_tools.device import Device, Element
+from kaede_android_tools.device import Device, Element
 
 XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 <hierarchy rotation="0">
