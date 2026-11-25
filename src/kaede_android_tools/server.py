@@ -40,23 +40,25 @@ def bridge() -> Web:
     return _web
 
 
-def _snapshot(image: bool, full: bool) -> str:
-    out = device().snapshot(full=full)
+def _snapshot(image: bool, full: bool, text_only: bool = False) -> str:
+    out = device().snapshot(full=full, text_only=text_only)
     if image:
         out += "\n[screenshot attached]"
     return out
 
 
-@mcp.tool()
-def see(image: bool = False, full: bool = False) -> str:
+@mcp.tool(structured_output=False)
+def see(image: bool = False, full: bool = False, text: bool = False) -> str:
     """Current screen as a compact, numbered list of interactive elements.
 
-    Ref them as #N in act(target=...). image=true also returns a screenshot.
+    Ref them as #N in act(target=...). text=true returns only the readable
+    text, for cases like reading a verification code out of an email.
+    image=true also returns a screenshot.
     """
-    return _snapshot(image, full)
+    return _snapshot(image, full, text)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def act(
     action: str,
     target: str | None = None,
@@ -71,11 +73,12 @@ def act(
 ) -> str:
     """Do one thing on the phone and return the resulting screen.
 
-    action: tap | type | swipe | key | launch | open_url | wait | shell
+    action: tap | type | swipe | key | launch | open_url | wait | refresh | shell
     target: '#3' | 'text=Foo' | '~foo' | 'id=pkg:id/name' | 'x,y'
     type uses text=, tap uses target=, key uses key= (back/home/enter/delete),
-    swipe uses direction= (up/down/left/right), launch uses text=<package>,
-    open_url uses text=<url>, shell uses text=<command>.
+    swipe uses direction= (up/down/left/right) or target='x1,y1' text='x2,y2',
+    launch uses text=<package>, open_url uses text=<url>, refresh reloads the
+    current list or page, shell uses text=<command>.
     """
     dev = device()
     action = action.lower().strip()
@@ -108,9 +111,22 @@ def act(
         return f"typed{note}\n{_snapshot(image, False)}"
 
     if action == "swipe":
-        dev.swipe_direction(direction or "up")
+        if target and text and "," in target and "," in text:
+            x1, y1 = (int(v) for v in target.split(","))
+            x2, y2 = (int(v) for v in text.split(","))
+            dev.swipe_xy(x1, y1, x2, y2)
+        else:
+            dev.swipe_direction(direction or "up")
         dev.wait_idle()
-        return f"ok swipe {direction or 'up'}\n{_snapshot(image, False)}"
+        return f"ok swipe\n{_snapshot(image, False)}"
+
+    if action == "refresh":
+        how = dev.refresh()
+        if how == "browser":
+            _reload_browser()
+        else:
+            dev.wait_idle()
+        return f"ok refresh\n{_snapshot(image, False)}"
 
     if action == "key":
         if not key:
@@ -146,7 +162,7 @@ def act(
     return f"unknown action {action!r}"
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def web(
     action: str,
     selector: str | None = None,
@@ -154,13 +170,18 @@ def web(
     text: str | None = None,
     url: str | None = None,
     page: str | None = None,
+    key: str | None = None,
 ) -> str:
     """The browser side of the phone, through Chrome DevTools.
 
-    action: pages | eval | fill | click | open
+    action: pages | text | eval | fill | click | click_text | press | type |
+            reload | open
     pages lists tabs (title, url, page id) across every Chrome process.
-    eval runs JS with script=; fill needs selector= and text=; click needs
-    selector=; open needs url= and loads it in the phone's browser.
+    text lists the visible text of the page; eval runs JS with script=.
+    fill needs selector= and text=; click needs selector=; click_text clicks
+        the element whose visible text matches text=; press sends key= (enter,
+        tab, escape, backspace); type writes text= into the focused field;
+        reload reloads the page; open needs url=.
     """
     bridge_ = bridge()
     action = action.lower().strip()
@@ -170,6 +191,30 @@ def web(
         if not pages:
             return "no debuggable page (open a browser tab on the phone)"
         return "\n".join(f"[{p['key']}] {p['title']!r} {p['url']}" for p in pages)
+
+    if action == "text":
+        return "\n".join(bridge_.visible_text(page)) or "(no text)"
+
+    if action == "click_text":
+        if not text:
+            return "click_text needs text="
+        ok = bridge_.click_text(text, page)
+        return f"click_text {text!r}: {'ok' if ok else 'not found'}"
+
+    if action == "press":
+        if not key:
+            return "press needs key="
+        bridge_.press(key, page)
+        return f"pressed {key}"
+
+    if action == "type":
+        if text is None:
+            return "type needs text="
+        return f"typed: {'ok' if bridge_.type_text(text, page) else 'no effect'}"
+
+    if action == "reload":
+        bridge_.reload(page)
+        return "reloaded"
 
     if action == "eval":
         if not script:
@@ -276,6 +321,19 @@ def _type(dev: Device, text: str, clear: bool) -> str:
     if _web_pages_with_focus(text):
         return ""
     return "write did not register (no focused field?)"
+
+
+def _reload_browser() -> None:
+    br = bridge()
+    try:
+        pages = br.pages()
+    except Exception:
+        return
+    for p in pages:
+        try:
+            br.reload(p["key"])
+        except Exception:
+            continue
 
 
 def main() -> None:

@@ -130,6 +130,37 @@ class Device:
         out = self.adb("shell", "dumpsys", "input_method")
         return "mInputShown=true" in out
 
+    def focus_window(self) -> tuple[str, str]:
+        """The window the system currently gives input to.
+
+        Differs from current_app() when an overlay steals focus: permission
+        dialogs, the intent resolver ("open with"), or a floating prompt.
+        """
+        try:
+            out = self.adb("shell", "dumpsys", "window", "windows")
+        except Exception:
+            return "", ""
+        for line in out.splitlines():
+            if "mCurrentFocus=" in line:
+                token = line.split("mCurrentFocus=")[-1].strip()
+                # Window{hash u0 pkg/cls} or Window{hash pkg/cls}
+                inner = token[token.find("{") + 1 : token.rfind("}")] if "{" in token else token
+                parts = inner.split()
+                target = parts[-1] if parts else ""
+                if "/" in target:
+                    pkg, _, cls = target.partition("/")
+                    return pkg, cls
+                return target, ""
+        return "", ""
+
+    def overlay(self) -> str:
+        """Name of a focus-stealing overlay above the foreground app, if any."""
+        pkg, cls = self.focus_window()
+        app_pkg, _ = self.current_app()
+        if pkg and pkg != app_pkg:
+            return f"{pkg}/{cls}"
+        return ""
+
     def is_browser(self, package: str) -> bool:
         return any(h in package.lower() for h in BROWSER_HINTS)
 
@@ -185,14 +216,26 @@ class Device:
         self._refs = {el.ref: el for el in out}
         return out
 
-    def snapshot(self, full: bool = False) -> str:
+    def snapshot(self, full: bool = False, text_only: bool = False) -> str:
         pkg, act = self.current_app()
         self._last_pkg = pkg
         w, h = self.screen_size()
         els = self.elements()
+        if text_only:
+            seen: list[str] = []
+            for e in els:
+                if e.text and e.text not in seen:
+                    seen.append(e.text)
+            return "\n".join(seen) if seen else "(no text on screen)"
         header = [
             f"app={pkg} act={act} {w}x{h} kb={'on' if self.keyboard_visible() else 'off'}"
         ]
+        # An overlay that stole focus is invisible in the app's own tree, and it
+        # is usually the thing blocking progress: permission prompts, "open
+        # with" sheets, "continue to the app" dialogs.
+        over = self.overlay()
+        if over:
+            header[0] += f" OVERLAY={over} (a dialog has focus; act on it first)"
         if self.is_browser(pkg):
             header[0] += " browser=1 (use web tool for page content)"
         # Actionable by default. Labels alone are noise for most tasks and
@@ -240,18 +283,33 @@ class Device:
         return None
 
     def _resolve_ref(self, ref: int) -> Element | None:
-        """Refs are per-snapshot; re-anchor on the live tree by signature."""
+        """Refs are per-snapshot; re-anchor on the live tree.
+
+        Text is a bad anchor for inputs: a field whose value we just typed no
+        longer matches its own old signature. For editable nodes anchor on
+        resource id plus the nearest centre instead.
+        """
         old = self._refs.get(ref)
         els = self.elements()
         if old is None:
             return None
+        if old.editable:
+            pool = [e for e in els if e.editable and e.rid == old.rid]
+            if not pool:
+                pool = [e for e in els if e.editable]
+            return self._nearest(pool, old) or None
         same = [e for e in els if e.signature() == old.signature()]
         if not same:
             return None
-        if len(same) > 1:
-            ocx, ocy = old.center
-            same.sort(key=lambda e: (e.center[0] - ocx) ** 2 + (e.center[1] - ocy) ** 2)
-        return same[0]
+        return self._nearest(same, old)
+
+    def _nearest(self, pool: list[Element], old: Element) -> Element | None:
+        if not pool:
+            return None
+        if len(pool) == 1:
+            return pool[0]
+        ocx, ocy = old.center
+        return min(pool, key=lambda e: (e.center[0] - ocx) ** 2 + (e.center[1] - ocy) ** 2)
 
     # ---------------------------------------------------------------- actions
     def tap(self, el: Element) -> None:
@@ -264,6 +322,21 @@ class Device:
 
     def swipe_xy(self, x1: int, y1: int, x2: int, y2: int, duration: float = 0.3) -> None:
         self.d().swipe(x1, y1, x2, y2, duration=duration)
+
+    def refresh(self) -> str:
+        """Make a stale list load again.
+
+        Browsers reload properly. Native apps do not expose a refresh verb, so
+        the honest fallback is a pull gesture from the top, which is what
+        Gmail, Play Store, Telegram and most list screens listen for.
+        """
+        pkg, _ = self.current_app()
+        if self.is_browser(pkg):
+            return "browser"
+        w, h = self.screen_size()
+        self.swipe_xy(w // 2, int(h * 0.20), w // 2, int(h * 0.72), duration=0.5)
+        time.sleep(1.2)
+        return "pull"
 
     def swipe_direction(self, direction: str, ratio: float = 0.6) -> None:
         w, h = self.screen_size()

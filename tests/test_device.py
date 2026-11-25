@@ -112,3 +112,70 @@ def test_snapshot_does_not_exceed_budget():
 def test_element_line_marks_capabilities():
     el = Element(1, "Go", "btn", "android.widget.Button", "", (0, 0, 10, 10), True, False)
     assert el.line() == "#1 btn 'Go' tap"
+
+
+# ---------------------------------------------------------------- new behaviour
+FOCUS_DUMP = """
+  mCurrentFocus=Window{2f1c3ab u0 com.android.chrome/org.chromium.chrome.browser.customtabs.CustomTabActivity}
+  mFocusedApp=ActivityRecord{abc u0 com.android.chrome/...}
+"""
+
+FOCUS_DIALOG = """
+  mCurrentFocus=Window{99 u0 com.android.intentresolver/.ChooserActivity}
+  mFocusedApp=ActivityRecord{abc u0 com.touchtype.swiftkey/...}
+"""
+
+
+class FocusDevice(FakeDevice):
+    dump = FOCUS_DUMP
+
+    def adb(self, *args, timeout=30):  # type: ignore[override]
+        return self.dump
+
+
+def test_focus_window_parses_target():
+    dev = FocusDevice()
+    assert dev.focus_window() == (
+        "com.android.chrome",
+        "org.chromium.chrome.browser.customtabs.CustomTabActivity",
+    )
+
+
+def test_overlay_is_flagged_when_focus_steals_from_app():
+    dev = FocusDevice()
+    dev.dump = FOCUS_DIALOG
+    assert dev.overlay() == "com.android.intentresolver/.ChooserActivity"
+
+
+def test_overlay_absent_when_focus_is_the_app():
+    dev = FocusDevice()
+    dev.dump = (
+        "  mCurrentFocus=Window{1 u0 com.app/.Main}\n"
+    )
+    assert dev.overlay() == ""
+
+
+def test_ref_reanchors_on_a_field_whose_text_changed():
+    """Typing rewrites the node's own text, so a text signature cannot anchor."""
+    dev = make()
+    field = next(e for e in dev.elements() if e.editable)
+    ref = field.ref
+    original = dev.raw_xml()
+
+    typed = original.replace(
+        'text="" resource-id="com.app:id/email"',
+        'text="hola@mundo.com" resource-id="com.app:id/email"',
+    )
+    dev.raw_xml = lambda: typed  # type: ignore[method-assign]
+    try:
+        again = dev._resolve_ref(ref)
+        assert again is not None and again.editable
+        assert again.rid == "com.app:id/email"
+    finally:
+        dev.raw_xml = lambda: original  # type: ignore[method-assign]
+
+
+def test_text_only_snapshot_returns_labels():
+    out = make().snapshot(text_only=True)
+    assert "Olvidaste tu contrasena" in out
+    assert "#" not in out
