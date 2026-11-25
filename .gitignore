@@ -6,3 +6,6 @@ dist/
 build/
 .pytest_cache/
 .uv/
+
+# Local only: tests stay out of the published package.
+tests/

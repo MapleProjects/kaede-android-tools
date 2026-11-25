@@ -96,9 +96,19 @@ class Web:
         if not pages:
             return None
         if page_id is None:
-            # Prefer a real document over chrome-native:// placeholder tabs.
+            # Prefer a real document over chrome-native:// placeholder tabs,
+            # and among those the tab that owns the keyboard: with no page=
+            # given the caller means the one on screen, and the list order is
+            # process order, not what the phone is showing.
             web_pages = [p for p in pages if p["url"].startswith("http")]
-            return (web_pages or pages)[0]
+            pool = web_pages or pages
+            for page in pool:
+                try:
+                    if self.ev("document.hasFocus()", page["key"]):
+                        return page
+                except Exception:
+                    continue
+            return pool[0]
         for page in pages:
             if page["key"] == page_id:
                 return page
@@ -146,25 +156,75 @@ class Web:
         return result.get("value")
 
     # -------------------------------------------------------------- helpers
+    # Reading back only the focused element is a lie on any form that spreads
+    # the value over several fields: an OTP page keeps one digit per input and
+    # moves focus after each keystroke, so the box in focus is empty again by
+    # the time a caller looks. Every check below joins all the visible fields.
+    FIELDS_JS = (
+        "Array.from(document.querySelectorAll("
+        "  'input:not([type=hidden]):not([type=submit]):not([type=button]),"
+        "   textarea,[contenteditable=true]'))"
+        "  .filter((e) => e.offsetParent !== null && !e.disabled)"
+    )
+
+    def field_values(self, page_id: str | None = None) -> list[str]:
+        script = f"(() => {{ return {self.FIELDS_JS}.map((e) => String(e.value ?? e.textContent ?? '')); }})()"
+        return list(self.ev(script, page_id) or [])
+
+    def holds(self, needle: str, page_id: str | None = None) -> bool:
+        """Whether the page's editable fields, taken together, hold `needle`."""
+        if not needle:
+            return False
+        values = self.field_values(page_id)
+        return needle in "".join(values) or any(needle in v for v in values)
+
     def fill(self, selector: str, text: str, page_id: str | None = None) -> str:
-        script = (
+        focus = (
             "(() => {"
             f"const el = document.querySelector({json.dumps(selector)});"
-            "if (!el) return {ok:false, error:'selector matched nothing'};"
+            "if (!el) return false;"
+            "el.scrollIntoView({block:'center'});"
             "el.focus();"
-            "const proto = el.tagName === 'TEXTAREA'"
-            "  ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
-            "const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;"
-            f"setter.call(el, {json.dumps(text)});"
-            "el.dispatchEvent(new Event('input', {bubbles:true}));"
-            "el.dispatchEvent(new Event('change', {bubbles:true}));"
-            "return {ok:true, value: el.value};"
+            "return true;"
             "})()"
         )
-        out = self.ev(script, page_id) or {}
-        if not out.get("ok"):
-            raise RuntimeError(out.get("error", "fill failed"))
-        return str(out.get("value", ""))
+        if not self.ev(focus, page_id):
+            raise RuntimeError("selector matched nothing")
+        # Keystrokes are what a person produces and what every auth form
+        # expects. Assigning the whole string at once satisfies a naive
+        # read-back while leaving an OTP form with its other boxes empty.
+        self._send_chars(text, page_id)
+        if self.holds(text, page_id):
+            return "".join(self.field_values(page_id))
+        return self.assign(text, page_id, selector)
+
+    def assign(self, text: str, page_id: str | None = None, selector: str | None = None):
+        """Last resort: set .value directly and fire input/change."""
+        target = (
+            f"document.querySelector({json.dumps(selector)})"
+            if selector
+            else "document.activeElement"
+        )
+        script = (
+            "(() => {"
+            f"const el = {target};"
+            "if (!el) return {ok:false, value:null};"
+            "if (el.isContentEditable) { el.textContent = "
+            + json.dumps(text)
+            + "; } else {"
+            "  const proto = el.tagName === 'TEXTAREA'"
+            "    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
+            "  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, "
+            + json.dumps(text)
+            + ");"
+            "}"
+            "el.dispatchEvent(new Event('input', {bubbles:true}));"
+            "el.dispatchEvent(new Event('change', {bubbles:true}));"
+            "return {ok:true, value: el.value ?? el.textContent ?? ''};"
+            "})()"
+        )
+        out = self.ev(script, page_id) or {"ok": False, "value": None}
+        return out.get("value") if out.get("ok") else None
 
     def click(self, selector: str, page_id: str | None = None) -> bool:
         script = (
@@ -206,6 +266,11 @@ class Web:
             }
             if kind == "char" and k != "Enter":
                 params.update({"text": "\t" if k == "Tab" else ""})
+            if kind == "rawKeyDown" and k == "Enter":
+                # Without the carriage return the browser never runs the
+                # implicit submit of a form, so "press enter" silently no-ops.
+                params["text"] = "\r"
+                params["unmodifiedText"] = "\r"
             self.call("Input.dispatchKeyEvent", params, page_id)
 
     def _rect_of(self, js_find: str, page_id: str | None = None) -> dict | None:
@@ -277,40 +342,89 @@ class Web:
         except Exception:
             self.ev("location.reload(); 1", page_id)
 
-    def type_text(self, text: str, page_id: str | None = None) -> bool:
+    FOCUS_JS = (
+        "(() => { const ok = (e) => !!e && (e.tagName === 'INPUT'"
+        "  || e.tagName === 'TEXTAREA' || e.isContentEditable);"
+        "let el = document.activeElement;"
+        "if (!ok(el)) { el = [...document.querySelectorAll("
+        "  'input:not([type=hidden]),textarea,[contenteditable=true]')]"
+        "  .find(e => e.offsetParent !== null && !e.disabled && !e.readOnly); }"
+        "if (el) { el.focus(); return 1; } return 0; })()"
+    )
+
+    def _typing_targets(self, page_id: str | None) -> list[dict]:
+        """Pages to try, in the order a person would.
+
+        Two tabs in different renderer processes can both answer
+        `document.hasFocus()` with true, and the one that does is not
+        necessarily the one with a field — so the caller gets an order, not an
+        answer, and the write is verified page by page.
+        """
+        if page_id is not None:
+            page = self._pick(page_id)
+            return [page] if page else []
+        pages = [p for p in self.pages() if p["url"].startswith("http")]
+        keyed = [p for p in pages if self.page_focused(p["key"])]
+        return keyed + [p for p in pages if p not in keyed]
+
+    def type_text(self, text: str, page_id: str | None = None, clear: bool = False) -> bool:
         """Focus the first usable field and type it like a person would.
 
         Real key events matter: one-shot value assignment leaves OTP boxes
         empty because their auto-advance handlers never fire.
         """
-        self.ev(
-            "(() => { const ok = (e) => !!e && (e.tagName === 'INPUT'"
-            "  || e.tagName === 'TEXTAREA' || e.isContentEditable);"
-            "let el = document.activeElement;"
-            "if (!ok(el)) { el = [...document.querySelectorAll("
-            "  'input:not([type=hidden]),textarea,[contenteditable=true]')]"
-            "  .find(e => e.offsetParent !== null && !e.disabled && !e.readOnly); }"
-            "if (el) { el.focus(); return 1; } return 0; })()",
-            page_id,
-        )
+        for page in self._typing_targets(page_id):
+            key = page["key"]
+            if not self.ev(self.FOCUS_JS, key):
+                continue
+            if clear:
+                self.clear_focused(key)
+            self._send_chars(text, key)
+            if self.holds(text, key):
+                return True
+        return False
+
+    def clear_focused(self, page_id: str | None = None) -> None:
+        """Select all and delete, through the same trusted input path."""
+        for kind in ("rawKeyDown", "keyUp"):
+            self.call(
+                "Input.dispatchKeyEvent",
+                {
+                    "type": kind,
+                    "key": "a",
+                    "code": "KeyA",
+                    "windowsVirtualKeyCode": 65,
+                    "nativeVirtualKeyCode": 65,
+                    "modifiers": 2,
+                },
+                page_id,
+            )
+        self.press("backspace", page_id)
+
+    def _send_chars(self, text: str, page_id: str | None = None) -> None:
+        """One trusted key event per character, never a bulk insert."""
         for ch in text:
-            base = {"windowsVirtualKeyCode": ord(ch.upper()), "nativeVirtualKeyCode": ord(ch)}
+            vk = ord(ch.upper()) if ch.isalnum() else 32 if ch == " " else None
+            if vk is None:
+                # Punctuation has no portable virtual-key code; insertText is
+                # the only way to get the character itself into the pipeline.
+                self.call("Input.insertText", {"text": ch}, page_id)
+                continue
+            base = {"windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
             self.call(
                 "Input.dispatchKeyEvent",
-                {"type": "keyDown", "text": ch, "key": ch, "unmodifiedText": ch, **base},
+                {
+                    "type": "keyDown",
+                    "text": ch,
+                    "unmodifiedText": ch,
+                    "key": ch,
+                    **base,
+                },
                 page_id,
             )
             self.call(
-                "Input.dispatchKeyEvent",
-                {"type": "keyUp", "key": ch, **base},
-                page_id,
+                "Input.dispatchKeyEvent", {"type": "keyUp", "key": ch, **base}, page_id
             )
-        value = self.ev(
-            "(() => { const e = document.activeElement;"
-            " return e ? String(e.value ?? e.textContent ?? '') : ''; })()",
-            page_id,
-        )
-        return bool(value)
 
     def focused_is_editable(self, page_id: str | None = None) -> bool:
         return bool(
@@ -322,10 +436,37 @@ class Web:
             )
         )
 
-    def fill_focused(self, text: str, page_id: str | None = None) -> dict:
+    def page_focused(self, page_id: str | None = None) -> bool:
+        """Whether the page owns keyboard focus.
+
+        False when the browser is in the background: CDP then accepts the key
+        events and drops them, so typing looks like it worked and nothing
+        changes. Saying so is the difference between "no effect" and a next
+        step.
+        """
+        try:
+            return bool(self.ev("document.hasFocus()", page_id))
+        except Exception:
+            return False
+
+    def any_page_focused(self) -> bool:
+        for page in self.pages():
+            try:
+                if self.page_focused(page["key"]):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def fill_focused(self, text: str, page_id: str | None = None, clear: bool = True) -> dict:
         """Write into the focused field, or the first visible one, without
-        depending on real focus. Returns {'ok': bool, 'value': str|None}."""
-        script = (
+        depending on real focus. Returns {'ok': bool, 'value': str|None}.
+
+        Keystrokes go first: they are the only thing an auto-advancing OTP
+        form or a framework-controlled input keeps. Assigning `.value` is the
+        fallback for the plain inputs that ignore the key pipeline.
+        """
+        focus = (
             "(() => {"
             "const editable = (e) => !!e && (e.tagName === 'INPUT'"
             "  || e.tagName === 'TEXTAREA' || e.isContentEditable);"
@@ -336,23 +477,19 @@ class Web:
             "     [contenteditable=true]'))"
             "    .find((e) => e.offsetParent !== null && !e.disabled && !e.readOnly);"
             "}"
-            "if (!el) return {ok:false, value:null};"
+            "if (!el) return false;"
             "el.focus();"
-            "if (el.isContentEditable) { el.textContent = "
-            + json.dumps(text)
-            + "; } else {"
-            "  const proto = el.tagName === 'TEXTAREA'"
-            "    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
-            "  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, "
-            + json.dumps(text)
-            + ");"
-            "}"
-            "el.dispatchEvent(new Event('input', {bubbles:true}));"
-            "el.dispatchEvent(new Event('change', {bubbles:true}));"
-            "return {ok:true, value: el.value ?? el.textContent ?? ''};"
+            "return true;"
             "})()"
         )
-        return self.ev(script, page_id) or {"ok": False, "value": None}
+        if not self.ev(focus, page_id):
+            return {"ok": False, "value": None}
+        if clear:
+            self.clear_focused(page_id)
+        self._send_chars(text, page_id)
+        if self.holds(text, page_id):
+            return {"ok": True, "value": "".join(self.field_values(page_id))}
+        return {"ok": True, "value": self.assign(text, page_id)}
 
     def alive(self) -> bool:
         return bool(self.pages())
